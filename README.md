@@ -1,15 +1,16 @@
 # flask-lens
 
 [![CI](https://github.com/duhanguler/flask-lens/actions/workflows/ci.yml/badge.svg)](https://github.com/duhanguler/flask-lens/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/flask-lens?style=flat-square&color=0D7A52&logo=pypi&logoColor=white)](https://pypi.org/project/flask-lens/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://www.python.org/downloads/)
-[![Typed](https://img.shields.io/badge/typing-PEP%20561%20strict-0ea5e9.svg)](src/flask_lens/py.typed)
-[![License: MIT](https://img.shields.io/badge/license-MIT-10b981.svg)](LICENSE)
+[![Typed](https://img.shields.io/badge/typing-PEP%20561%20strict-0ea5e9.svg)](https://github.com/duhanguler/flask-lens/blob/main/src/flask_lens/py.typed)
+[![License: MIT](https://img.shields.io/badge/license-MIT-10b981.svg)](https://github.com/duhanguler/flask-lens/blob/main/LICENSE)
 
 **Real-time developer observability, SQL/N+1 profiler, EXPLAIN analyzer, cProfile flamegraph, request replayer, and Django-style `assertNumQueries` guardrails for Flask — in two lines of code.**
 
 Mount `Lens(app, db=db)` to open a zero-dependency DevTools console at `/__lens` that works across **JSON REST APIs, HTMX, webhooks, SPAs, and server-rendered HTML**.
 
-![flask-lens Overview and N+1 Detection](docs/assets/overview-n1.png)
+![flask-lens Overview and N+1 Detection](https://raw.githubusercontent.com/duhanguler/flask-lens/main/docs/assets/overview-n1.png)
 
 ---
 
@@ -100,25 +101,25 @@ python examples/bookstore_app.py
 
 Every SQLAlchemy query is canonicalized into a normalized fingerprint, tagged for **N+1**, **duplicate**, and **slow** behavior, and mapped back to your exact application source line. Clicking **EXPLAIN** runs a read-only `EXPLAIN` / `EXPLAIN QUERY PLAN` (strictly rejecting mutating or multi-statement SQL) and highlights full table scans (`SCAN` / `Seq Scan`) and temporary sorts (`USE TEMP B-TREE` / `filesort`).
 
-![SQL Inspector, Source Snippet and SQLite EXPLAIN](docs/assets/sql-explain.png)
+![SQL Inspector, Source Snippet and SQLite EXPLAIN](https://raw.githubusercontent.com/duhanguler/flask-lens/main/docs/assets/sql-explain.png)
 
 ### 2. Interactive `cProfile` SVG Flamegraph
 
 Inspect per-request CPU hotspots with a zoomable SVG flamegraph and flat function table color-coded by layer (**User Code**, **Framework**, **Third-Party**, **Stdlib**). Control profiling scope via `profile_mode` (`"always"`, `"slow"`, `"on_demand"`, `"off"`), the `@lens.profile` view decorator, or the `X-Lens-Profile: 1` request header.
 
-![Interactive cProfile SVG Flamegraph](docs/assets/flamegraph.png)
+![Interactive cProfile SVG Flamegraph](https://raw.githubusercontent.com/duhanguler/flask-lens/main/docs/assets/flamegraph.png)
 
 ### 3. Request Replay & Before/After Diff Comparator
 
 Edit headers, query parameters, or JSON payloads directly inside `/__lens`, replay the request against your live Flask app, and compare **Before vs After** latency, SQL query count, N+1 resolution status, and normalized SQL fingerprint diffs side by side.
 
-![Before and After Request Comparison Diff](docs/assets/compare-diff.png)
+![Before and After Request Comparison Diff](https://raw.githubusercontent.com/duhanguler/flask-lens/main/docs/assets/compare-diff.png)
 
 ### 4. Structured Exception Inspector with Secret Redaction
 
 Unhandled exceptions are captured in both `debug`/`testing` and production modes with clickable stack frames, source context lines, and a local-variable table where sensitive keys (`password`, `token`, `api_key`, `secret`, `Authorization`, `Cookie`, etc.) are automatically scrubbed to `[REDACTED]`.
 
-![Exception Traceback and Redacted Local Variables](docs/assets/exception-inspector.png)
+![Exception Traceback and Redacted Local Variables](https://raw.githubusercontent.com/duhanguler/flask-lens/main/docs/assets/exception-inspector.png)
 
 ---
 
@@ -147,7 +148,7 @@ def test_authors_declarative(client, db):
     assert client.get("/api/authors?optimized=1").status_code == 200
 ```
 
-See [docs/testing-guardrails.md](docs/testing-guardrails.md) for fixtures, custom thresholds, and failure reports.
+See [docs/testing-guardrails.md](https://github.com/duhanguler/flask-lens/blob/main/docs/testing-guardrails.md) for fixtures, custom thresholds, and failure reports.
 
 ---
 
@@ -192,7 +193,7 @@ flask lens clear                      # Wipe stored ring-buffer telemetry
 
 ## Measured Overhead Benchmarks
 
-Measured locally with [`benchmarks/bench_overhead.py`](benchmarks/bench_overhead.py) (CPython 3.13, macOS Apple Silicon, 300 iterations after 30 warmup iterations per scenario):
+Measured locally with [`benchmarks/bench_overhead.py`](https://github.com/duhanguler/flask-lens/blob/main/benchmarks/bench_overhead.py) (CPython 3.13, macOS Apple Silicon, 300 iterations after 30 warmup iterations per scenario):
 
 | Scenario | JSON Route (`/ping`) Mean | JSON Delta | SQLAlchemy Route (`/items`) Mean | SQLAlchemy Delta |
 | :--- | ---: | ---: | ---: | ---: |
@@ -232,7 +233,7 @@ flowchart LR
 - **Safe `EXPLAIN`:** Strictly limited to single, read-only `SELECT` statements; mutating DML/DDL and multi-statement queries are rejected.
 - **Safe Replay:** Restricted to relative application paths; `/__lens` routes and external URLs are rejected to prevent recursion and SSRF.
 
-Read [docs/configuration.md](docs/configuration.md) and [SECURITY.md](SECURITY.md) for full details.
+Read [docs/configuration.md](https://github.com/duhanguler/flask-lens/blob/main/docs/configuration.md) and [SECURITY.md](https://github.com/duhanguler/flask-lens/blob/main/SECURITY.md) for full details.
 
 ---
 
@@ -247,4 +248,4 @@ make build     # Build wheel & sdist via hatchling
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/duhanguler/flask-lens/blob/main/LICENSE).

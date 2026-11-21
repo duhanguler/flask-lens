@@ -27,7 +27,7 @@ from flask_lens.testing import (
     capture_queries,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "CapturedRequest",
