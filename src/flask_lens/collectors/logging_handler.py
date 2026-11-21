@@ -1,11 +1,16 @@
-"""Request-scoped Python logging handler."""
+"""Request-scoped Python logging handler with ref-counted global registration."""
 
 from __future__ import annotations
 
 import logging
+import threading
 
 from flask_lens.collectors.context import get_active_request, is_capture_suspended
 from flask_lens.models import LogEntry
+
+_LOG_LOCK = threading.Lock()
+_LOG_REF_COUNT = 0
+_SHARED_HANDLER: LensLogHandler | None = None
 
 
 class LensLogHandler(logging.Handler):
@@ -38,3 +43,26 @@ class LensLogHandler(logging.Handler):
                 function=record.funcName,
             )
         )
+
+
+def install_log_handler() -> LensLogHandler:
+    """Attach a single shared :class:`LensLogHandler` to the root logger (ref-counted)."""
+    global _LOG_REF_COUNT, _SHARED_HANDLER
+    with _LOG_LOCK:
+        _LOG_REF_COUNT += 1
+        if _SHARED_HANDLER is None:
+            _SHARED_HANDLER = LensLogHandler()
+            logging.getLogger().addHandler(_SHARED_HANDLER)
+        return _SHARED_HANDLER
+
+
+def uninstall_log_handler() -> None:
+    """Decrement ref count and remove the shared handler when no Lens instances remain."""
+    global _LOG_REF_COUNT, _SHARED_HANDLER
+    with _LOG_LOCK:
+        if _LOG_REF_COUNT <= 0:
+            return
+        _LOG_REF_COUNT -= 1
+        if _LOG_REF_COUNT == 0 and _SHARED_HANDLER is not None:
+            logging.getLogger().removeHandler(_SHARED_HANDLER)
+            _SHARED_HANDLER = None

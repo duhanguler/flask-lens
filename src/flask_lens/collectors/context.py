@@ -28,6 +28,7 @@ class RequestContext:
     replayed_from: str | None = None
     force_profile: bool = False
     profiler: RequestProfiler | None = None
+    watched_engine_ids: set[str] = field(default_factory=set)
 
     sql_queries: list[SQLQuery] = field(default_factory=list)
     outgoing_http: list[OutgoingHTTP] = field(default_factory=list)

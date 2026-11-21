@@ -35,7 +35,7 @@ _SKIP_PATH_FRAGMENTS: tuple[str, ...] = (
 )
 
 _STDLIB_PREFIXES: tuple[str, ...] = tuple(
-    p
+    os.path.abspath(p)
     for p in {
         os.path.dirname(os.__file__),
         os.path.dirname(threading.__file__),
@@ -52,9 +52,9 @@ class RawParamsCache:
         self._lock = threading.Lock()
         self._data: OrderedDict[str, tuple[str, Any]] = OrderedDict()
 
-    def put(self, query_id: str, engine_name: str, params: Any) -> None:
+    def put(self, query_id: str, engine_id: str, params: Any) -> None:
         with self._lock:
-            self._data[query_id] = (engine_name, params)
+            self._data[query_id] = (engine_id, params)
             self._data.move_to_end(query_id)
             while len(self._data) > self._maxsize:
                 self._data.popitem(last=False)
@@ -72,7 +72,11 @@ class RawParamsCache:
 
 
 _ENGINE_LOCK = threading.Lock()
-_HOOKED_ENGINES: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+# Maps Engine -> (unique_engine_id, display_name)
+_HOOKED_ENGINES: weakref.WeakKeyDictionary[Any, tuple[str, str]] = weakref.WeakKeyDictionary()
+# Maps unique_engine_id -> Engine (never collides across multiple apps/engines!)
+_ENGINES_BY_ID: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+# Maps logical display_name -> most recently registered Engine (fallback)
 _REGISTERED_ENGINES: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 _QUERY_LISTENERS: list[Callable[[SQLQuery, str, Any], None]] = []
 _RAW_PARAMS_CACHE = RawParamsCache()
@@ -82,18 +86,21 @@ def get_raw_params_cache() -> RawParamsCache:
     return _RAW_PARAMS_CACHE
 
 
-def get_registered_engine(name: str = "default") -> Any | None:
+def get_registered_engine(engine_key: str = "default") -> Any | None:
     with _ENGINE_LOCK:
-        engine = _REGISTERED_ENGINES.get(name)
+        engine = _ENGINES_BY_ID.get(engine_key)
         if engine is not None:
             return engine
-        for eng in _REGISTERED_ENGINES.values():
+        engine = _REGISTERED_ENGINES.get(engine_key)
+        if engine is not None:
+            return engine
+        for eng in _ENGINES_BY_ID.values():
             return eng
         return None
 
 
 def register_query_sink(callback: Callable[[SQLQuery, str, Any], None]) -> None:
-    """Register a process-wide query sink (called when any watched engine executes SQL)."""
+    """Register a process-wide query sink receiving ``(query, engine_id, raw_params)``."""
     with _ENGINE_LOCK:
         if callback not in _QUERY_LISTENERS:
             _QUERY_LISTENERS.append(callback)
@@ -108,22 +115,26 @@ def unregister_query_sink(callback: Callable[[SQLQuery, str, Any], None]) -> Non
 def attach_engine(engine: Any, name: str | None = None) -> str:
     """Idempotently attach SQLAlchemy cursor execution hooks to *engine*.
 
-    Returns the registered engine name. Safe to call repeatedly on the same engine.
+    Returns the unique ``engine_id`` for this engine instance. Safe to call
+    repeatedly on the same engine and isolated across distinct engines even if
+    they share the logical bind name ``"default"``.
     """
     from sqlalchemy import event  # optional dependency
 
     actual_engine = getattr(engine, "sync_engine", engine)
     with _ENGINE_LOCK:
-        existing_name = _HOOKED_ENGINES.get(actual_engine)
-        if existing_name is not None:
-            _REGISTERED_ENGINES[existing_name] = actual_engine
-            return existing_name
+        existing = _HOOKED_ENGINES.get(actual_engine)
+        if existing is not None:
+            existing_id, existing_name = existing
+            _ENGINES_BY_ID[existing_id] = actual_engine
+            _REGISTERED_ENGINES[name or existing_name] = actual_engine
+            return existing_id
 
-        engine_name = name or (
-            "default" if "default" not in _REGISTERED_ENGINES else f"engine_{id(actual_engine)}"
-        )
-        _HOOKED_ENGINES[actual_engine] = engine_name
-        _REGISTERED_ENGINES[engine_name] = actual_engine
+        display_name = name or "default"
+        engine_id = f"eng_{uuid.uuid4().hex[:10]}"
+        _HOOKED_ENGINES[actual_engine] = (engine_id, display_name)
+        _ENGINES_BY_ID[engine_id] = actual_engine
+        _REGISTERED_ENGINES[display_name] = actual_engine
 
     dialect_name = getattr(getattr(actual_engine, "dialect", None), "name", "unknown")
 
@@ -156,7 +167,8 @@ def attach_engine(engine: Any, name: str | None = None) -> str:
             parameters=parameters,
             duration_ms=duration_ms,
             rowcount=getattr(cursor, "rowcount", None),
-            engine_name=engine_name,
+            engine_id=engine_id,
+            engine_name=display_name,
             dialect=dialect_name,
         )
 
@@ -178,11 +190,12 @@ def attach_engine(engine: Any, name: str | None = None) -> str:
             parameters=getattr(exception_context, "parameters", None),
             duration_ms=duration_ms,
             rowcount=None,
-            engine_name=engine_name,
+            engine_id=engine_id,
+            engine_name=display_name,
             dialect=dialect_name,
         )
 
-    return engine_name
+    return engine_id
 
 
 def _dispatch_sql_event(
@@ -191,6 +204,7 @@ def _dispatch_sql_event(
     parameters: Any,
     duration_ms: float,
     rowcount: int | None,
+    engine_id: str,
     engine_name: str,
     dialect: str,
 ) -> None:
@@ -202,6 +216,13 @@ def _dispatch_sql_event(
     req_ctx = get_active_request()
     with _ENGINE_LOCK:
         extra_sinks = list(_QUERY_LISTENERS)
+
+    # Isolate multi-app engines when the owning LensState explicitly tracks engines.
+    if req_ctx is not None and (
+        not req_ctx.config.capture_sql
+        or (req_ctx.watched_engine_ids and engine_id not in req_ctx.watched_engine_ids)
+    ):
+        req_ctx = None
 
     if req_ctx is None and not extra_sinks:
         return
@@ -215,22 +236,19 @@ def _dispatch_sql_event(
 
     if req_ctx is not None:
         cfg = req_ctx.config
-        if not cfg.capture_sql:
-            req_ctx = None
-        else:
-            offset_ms = round((time.perf_counter() - req_ctx.start_perf) * 1000.0 - duration_ms, 3)
-            if offset_ms < 0.0:
-                offset_ms = 0.0
-            if cfg.capture_stack_frames:
-                frames, call_site = capture_stack_frames(
-                    app_root=cfg.app_root,
-                    max_frames=cfg.max_stack_frames,
-                )
-            redacted_params = redact_sql_params(
-                parameters,
-                cfg.sensitive_fields,
-                enabled=cfg.redact_sensitive,
+        offset_ms = round((time.perf_counter() - req_ctx.start_perf) * 1000.0 - duration_ms, 3)
+        if offset_ms < 0.0:
+            offset_ms = 0.0
+        if cfg.capture_stack_frames:
+            frames, call_site = capture_stack_frames(
+                app_root=cfg.app_root,
+                max_frames=cfg.max_stack_frames,
             )
+        redacted_params = redact_sql_params(
+            parameters,
+            cfg.sensitive_fields,
+            enabled=cfg.redact_sensitive,
+        )
     elif extra_sinks:
         frames, call_site = capture_stack_frames(app_root=None, max_frames=6)
         redacted_params = redact_sql_params(parameters, frozenset(), enabled=False)
@@ -254,10 +272,10 @@ def _dispatch_sql_event(
 
     if req_ctx is not None:
         req_ctx.sql_queries.append(query)
-        _RAW_PARAMS_CACHE.put(query_id, engine_name, parameters)
+        _RAW_PARAMS_CACHE.put(query_id, engine_id, parameters)
 
     for sink in extra_sinks:
-        sink(query, engine_name, parameters)
+        sink(query, engine_id, parameters)
 
 
 def capture_stack_frames(
@@ -304,7 +322,6 @@ def capture_stack_frames(
             )
         frame = frame.f_back
 
-    # Pick the closest user frame as primary call_site; fall back to innermost non-skipped frame.
     primary = next((f for f in frames if f.is_user_code), frames[0] if frames else None)
     call_site = f"{primary.filename}:{primary.lineno} in {primary.function}" if primary else ""
     return frames, call_site
@@ -317,7 +334,6 @@ def discover_engines_from_app(app: Flask) -> list[tuple[str, Any]]:
     if sqla is None:
         return found
 
-    # Flask-SQLAlchemy 3.x: db.engines (requires app context)
     try:
         with app.app_context():
             engines = getattr(sqla, "engines", None)
@@ -330,7 +346,6 @@ def discover_engines_from_app(app: Flask) -> list[tuple[str, Any]]:
                 if eng is not None:
                     found.append(("default", eng))
     except Exception:
-        # Engine may not be configured yet; will retry lazily when requests execute.
         pass
     return found
 
@@ -340,13 +355,11 @@ def resolve_engines(target: Any, *, app: Flask | None = None) -> list[tuple[str,
     if target is None:
         return []
 
-    # Direct SQLAlchemy Engine / AsyncEngine
     if hasattr(target, "dialect") and hasattr(target, "connect"):
         return [("default", target)]
     if hasattr(target, "sync_engine"):
         return [("default", target.sync_engine)]
 
-    # SQLAlchemy Session / scoped_session
     if hasattr(target, "get_bind"):
         try:
             bind = target.get_bind()
@@ -355,11 +368,9 @@ def resolve_engines(target: Any, *, app: Flask | None = None) -> list[tuple[str,
         except Exception:
             pass
 
-    # Flask app
     if hasattr(target, "extensions") and hasattr(target, "app_context"):
         return discover_engines_from_app(target)
 
-    # Flask-SQLAlchemy SQLAlchemy() instance (may require app context for `.engines`)
     if app is not None:
         try:
             with app.app_context():
@@ -385,7 +396,6 @@ def resolve_engines(target: Any, *, app: Flask | None = None) -> list[tuple[str,
                 if eng is not None
             ]
     except RuntimeError:
-        # Outside app context: inspect Flask-SQLAlchemy 3.x registered `_app_engines` map.
         app_engines = getattr(target, "_app_engines", None)
         if app_engines is not None:
             resolved: list[tuple[str, Any]] = []
@@ -410,6 +420,13 @@ def resolve_engines(target: Any, *, app: Flask | None = None) -> list[tuple[str,
     )
 
 
+def _is_within(path: str, directory: str) -> bool:
+    try:
+        return os.path.commonpath([path, directory]) == directory
+    except ValueError:
+        return False
+
+
 def _should_skip_frame(filename: str) -> bool:
     if not filename or filename.startswith("<"):
         return True
@@ -420,16 +437,16 @@ def _is_user_frame(filename: str, app_root: str | None) -> bool:
     abs_path = os.path.abspath(filename)
     if "site-packages" in abs_path or "dist-packages" in abs_path:
         return False
-    if any(abs_path.startswith(prefix) for prefix in _STDLIB_PREFIXES):
+    if any(_is_within(abs_path, prefix) for prefix in _STDLIB_PREFIXES):
         return False
     if app_root:
-        return abs_path.startswith(app_root)
+        return _is_within(abs_path, app_root)
     return True
 
 
 def _shorten_path(filename: str, app_root: str | None) -> str:
     abs_path = os.path.abspath(filename)
-    if app_root and abs_path.startswith(app_root):
+    if app_root and _is_within(abs_path, app_root):
         return os.path.relpath(abs_path, app_root)
     parts = abs_path.split(os.sep)
     if len(parts) > 3:

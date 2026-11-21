@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import contextlib
-import functools
-import logging
+import posixpath
 import queue
 import random
 import threading
 import time
+import urllib.parse
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
 from flask import Flask, Response, g, got_request_exception, request, template_rendered
 
@@ -27,11 +27,11 @@ from flask_lens.collectors.context import (
 )
 from flask_lens.collectors.exceptions import capture_exception
 from flask_lens.collectors.http_outgoing import install_http_hooks, uninstall_http_hooks
-from flask_lens.collectors.logging_handler import LensLogHandler
+from flask_lens.collectors.logging_handler import install_log_handler, uninstall_log_handler
 from flask_lens.collectors.profiler import RequestProfiler
 from flask_lens.config import LensConfig
 from flask_lens.models import CapturedRequest, CustomSpan
-from flask_lens.redaction import redact_body, redact_headers
+from flask_lens.redaction import redact_body, redact_headers, redact_query_string
 from flask_lens.sql.analyzer import analyze_queries
 from flask_lens.sql.explain import ExplainResult, run_explain
 from flask_lens.sql.listener import (
@@ -45,12 +45,10 @@ from flask_lens.storage.base import StorageBackend, compute_request_diff
 from flask_lens.storage.memory import MemoryStorage
 from flask_lens.storage.sqlite import SQLiteStorage
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
 F = TypeVar("F", bound=Callable[..., Any])
 
 _PROFILE_ATTR = "_flask_lens_profile"
+STREAM_STOP = object()
 
 
 class StreamBroadcaster:
@@ -58,16 +56,16 @@ class StreamBroadcaster:
 
     def __init__(self, max_queue_size: int = 128) -> None:
         self._lock = threading.Lock()
-        self._subscribers: list[queue.Queue[dict[str, Any]]] = []
+        self._subscribers: list[queue.Queue[Any]] = []
         self._max_queue_size = max_queue_size
 
-    def subscribe(self) -> queue.Queue[dict[str, Any]]:
-        q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=self._max_queue_size)
+    def subscribe(self) -> queue.Queue[Any]:
+        q: queue.Queue[Any] = queue.Queue(maxsize=self._max_queue_size)
         with self._lock:
             self._subscribers.append(q)
         return q
 
-    def unsubscribe(self, q: queue.Queue[dict[str, Any]]) -> None:
+    def unsubscribe(self, q: queue.Queue[Any]) -> None:
         with self._lock:
             if q in self._subscribers:
                 self._subscribers.remove(q)
@@ -84,6 +82,15 @@ class StreamBroadcaster:
                 with contextlib.suppress(queue.Full):
                     q.put_nowait(payload)
 
+    def close(self) -> None:
+        """Signal all active SSE subscribers to terminate cleanly."""
+        with self._lock:
+            subscribers = list(self._subscribers)
+            self._subscribers.clear()
+        for q in subscribers:
+            with contextlib.suppress(queue.Full):
+                q.put_nowait(STREAM_STOP)
+
 
 @dataclass
 class LensState:
@@ -94,8 +101,10 @@ class LensState:
     storage: StorageBackend
     broadcaster: StreamBroadcaster = field(default_factory=StreamBroadcaster)
     watched_engines: dict[str, Any] = field(default_factory=dict)
+    watched_engines_by_id: dict[str, Any] = field(default_factory=dict)
+    watched_engine_ids: set[str] = field(default_factory=set)
     engines_discovered: bool = False
-    log_handler: LensLogHandler | None = None
+    log_handler_installed: bool = False
     http_hooks_installed: bool = False
     _signal_receivers: list[tuple[Any, Callable[..., Any]]] = field(default_factory=list)
     _closed: bool = False
@@ -104,10 +113,12 @@ class LensState:
         """Attach SQLAlchemy instrumentation to an Engine, Session, or Flask-SQLAlchemy db."""
         attached: list[str] = []
         for resolved_name, eng in resolve_engines(engine_or_db, app=self.app):
-            target_name = name or resolved_name
-            reg_name = attach_engine(eng, name=target_name)
-            self.watched_engines[reg_name] = eng
-            attached.append(reg_name)
+            display_name = name or resolved_name
+            engine_id = attach_engine(eng, name=display_name)
+            self.watched_engines[display_name] = eng
+            self.watched_engines_by_id[engine_id] = eng
+            self.watched_engine_ids.add(engine_id)
+            attached.append(display_name)
         return attached
 
     def ensure_engines_discovered(self) -> None:
@@ -116,8 +127,10 @@ class LensState:
         discovered = discover_engines_from_app(self.app)
         if discovered:
             for name, eng in discovered:
-                reg_name = attach_engine(eng, name=name)
-                self.watched_engines[reg_name] = eng
+                engine_id = attach_engine(eng, name=name)
+                self.watched_engines[name] = eng
+                self.watched_engines_by_id[engine_id] = eng
+                self.watched_engine_ids.add(engine_id)
             self.engines_discovered = True
 
     def explain_query(self, request_id: str, query_id: str) -> ExplainResult:
@@ -150,15 +163,23 @@ class LensState:
 
         cached = get_raw_params_cache().get(query_id)
         if cached is not None:
-            engine_name, raw_params = cached
+            engine_key, raw_params = cached
         else:
-            engine_name = query.engine_name
+            engine_key = query.engine_name
             raw_params = query.params
 
-        engine = self.watched_engines.get(engine_name) or get_registered_engine(engine_name)
+        engine = (
+            self.watched_engines_by_id.get(engine_key)
+            or self.watched_engines.get(query.engine_name)
+            or get_registered_engine(engine_key)
+        )
         if engine is None:
             self.ensure_engines_discovered()
-            engine = self.watched_engines.get(engine_name) or get_registered_engine(engine_name)
+            engine = (
+                self.watched_engines_by_id.get(engine_key)
+                or self.watched_engines.get(query.engine_name)
+                or get_registered_engine(engine_key)
+            )
         if engine is None:
             return ExplainResult(
                 supported=False,
@@ -187,19 +208,12 @@ class LensState:
         if clean_method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
             raise ValueError(f"Unsupported HTTP method: {clean_method!r}")
 
-        clean_path = path.strip()
-        if not clean_path.startswith("/") or clean_path.startswith("//"):
-            raise ValueError("Replay path must be a relative path starting with '/'.")
-        if clean_path == self.config.url_prefix or clean_path.startswith(
-            self.config.url_prefix + "/"
-        ):
-            raise ValueError("Replaying Lens internal endpoints is not permitted.")
+        clean_path = _validate_replay_path(path, self.config.url_prefix)
 
         replay_headers: dict[str, str] = {}
         if headers:
             for k, v in headers.items():
                 lk = k.lower()
-                # Skip hop-by-hop headers and redacted placeholders
                 if lk in {"host", "content-length", "transfer-encoding"}:
                     continue
                 if v == "[REDACTED]":
@@ -210,14 +224,19 @@ class LensState:
         if original_request_id:
             replay_headers["X-Lens-Replay-From"] = original_request_id
 
-        with self.app.test_client() as client:
-            resp = client.open(
-                path=clean_path,
-                method=clean_method,
-                headers=replay_headers,
-                data=body.encode("utf-8") if body is not None and body != "" else None,
-            )
-            new_request_id = resp.headers.get("X-Lens-Request-Id")
+        # Isolate any outer active RequestContext when replay_request() is invoked programmatically.
+        outer_token = set_active_request(None)
+        try:
+            with self.app.test_client() as client:
+                resp = client.open(
+                    path=clean_path,
+                    method=clean_method,
+                    headers=replay_headers,
+                    data=body.encode("utf-8") if body is not None and body != "" else None,
+                )
+                new_request_id = resp.headers.get("X-Lens-Request-Id")
+        finally:
+            reset_active_request(outer_token)
 
         new_captured = self.storage.get(new_request_id) if new_request_id else None
         diff: dict[str, Any] | None = None
@@ -237,9 +256,10 @@ class LensState:
         if self._closed:
             return
         self._closed = True
-        if self.log_handler is not None:
-            logging.getLogger().removeHandler(self.log_handler)
-            self.log_handler = None
+        self.broadcaster.close()
+        if self.log_handler_installed:
+            uninstall_log_handler()
+            self.log_handler_installed = False
         if self.http_hooks_installed:
             uninstall_http_hooks()
             self.http_hooks_installed = False
@@ -300,21 +320,17 @@ class Lens:
         elif storage_arg is not None:
             custom_backend = storage_arg
 
-        cfg = config or self._default_config
-        if cfg is None:
+        base_cfg = config or self._default_config
+        if base_cfg is None:
             cfg = LensConfig.from_flask_config(app, overrides=merged_options)
-        elif merged_options:
-            for k, v in merged_options.items():
-                if not hasattr(cfg, k):
-                    raise ValueError(f"Unknown LensConfig option: {k!r}")
-                setattr(cfg, k, v)
-
-        if not cfg.url_prefix.startswith("/"):
-            cfg.url_prefix = "/" + cfg.url_prefix
-        cfg.url_prefix = cfg.url_prefix.rstrip("/") or "/__lens"
-
-        if cfg.app_root is None and getattr(app, "root_path", None):
-            cfg.app_root = app.root_path
+        else:
+            if (
+                "app_root" not in merged_options
+                and base_cfg.app_root is None
+                and getattr(app, "root_path", None)
+            ):
+                merged_options["app_root"] = app.root_path
+            cfg = base_cfg.copy_with(**merged_options)
 
         backend: StorageBackend
         if custom_backend is not None:
@@ -339,11 +355,10 @@ class Lens:
                 state.watch_engine(engine)
             state.ensure_engines_discovered()
 
-        # Install request-scoped log handler
+        # Install shared ref-counted log handler
         if cfg.capture_logs:
-            handler = LensLogHandler()
-            logging.getLogger().addHandler(handler)
-            state.log_handler = handler
+            install_log_handler()
+            state.log_handler_installed = True
 
         # Install outgoing HTTP instrumentation
         if cfg.capture_outgoing_http:
@@ -390,9 +405,9 @@ class Lens:
             self._state.close()
 
     @staticmethod
-    def span(name: str, **metadata: Any) -> Iterator[dict[str, Any]]:
+    def span(name: str, **metadata: Any) -> contextlib.AbstractContextManager[dict[str, Any]]:
         """Context manager recording a custom timed span on the active request."""
-        return span(name, **metadata)  # type: ignore[return-value]
+        return span(name, **metadata)
 
     @staticmethod
     def event(name: str, metadata: dict[str, Any] | None = None) -> None:
@@ -401,15 +416,13 @@ class Lens:
 
     @staticmethod
     def profile(func: F) -> F:
-        """Decorator ensuring cProfile runs whenever this view function is invoked."""
+        """Decorator ensuring cProfile runs whenever this view function is invoked.
+
+        Works transparently with both synchronous (``def``) and asynchronous
+        (``async def``) Flask views without adding wrapper frame noise.
+        """
         setattr(func, _PROFILE_ATTR, True)
-
-        @functools.wraps(func)
-        def _wrapped(*args: Any, **kwargs: Any) -> Any:
-            return func(*args, **kwargs)
-
-        setattr(_wrapped, _PROFILE_ATTR, True)
-        return _wrapped  # type: ignore[return-value]
+        return func
 
     def _register_hooks(self, app: Flask, state: LensState) -> None:
         @app.before_request
@@ -448,6 +461,7 @@ class Lens:
                 replayed_from=replayed_from,
                 force_profile=should_profile,
                 profiler=profiler,
+                watched_engine_ids=set(state.watched_engine_ids),
             )
             token = set_active_request(ctx)
             g._flask_lens_ctx = ctx
@@ -546,6 +560,20 @@ class Lens:
         state._signal_receivers.append((template_rendered, _on_template_rendered))
 
 
+def _validate_replay_path(raw_path: str, url_prefix: str) -> str:
+    clean_path = raw_path.strip()
+    if not clean_path.startswith("/") or clean_path.startswith("//") or "\\" in clean_path:
+        raise ValueError("Replay path must be a relative path starting with '/'.")
+    parsed = urllib.parse.urlsplit(clean_path)
+    if parsed.scheme or parsed.netloc:
+        raise ValueError("Replay path must be a relative path without host or scheme.")
+    decoded_path = urllib.parse.unquote(parsed.path)
+    normalized_path = posixpath.normpath(decoded_path)
+    if normalized_path == url_prefix or normalized_path.startswith(url_prefix + "/"):
+        raise ValueError("Replaying Lens internal endpoints is not permitted.")
+    return clean_path
+
+
 def _should_ignore_request(cfg: LensConfig) -> bool:
     path = request.path
     if path == cfg.url_prefix or path.startswith(cfg.url_prefix + "/"):
@@ -563,7 +591,6 @@ def _should_profile_request(app: Flask, cfg: LensConfig) -> bool:
         return False
     if cfg.profile_mode in {"always", "slow"}:
         return True
-    # on_demand mode: check header or @lens.profile view marker
     if request.headers.get("X-Lens-Profile") in {"1", "true", "yes"}:
         return True
     if request.endpoint:
@@ -586,7 +613,6 @@ def _finalize_request(
 
     duration_ms = round((time.perf_counter() - ctx.start_perf) * 1000.0, 3)
 
-    # In "slow" profile mode, only persist profile data if duration exceeded threshold
     if (
         cfg.profile_mode == "slow"
         and duration_ms < cfg.profile_slow_ms
@@ -636,7 +662,12 @@ def _finalize_request(
             resp_size = response.calculate_content_length() or 0
             resp_body = "<streaming response>"
 
-    query_string = request.query_string.decode("utf-8", errors="replace")
+    raw_qs = request.query_string.decode("utf-8", errors="replace")
+    query_string = redact_query_string(
+        raw_qs,
+        cfg.sensitive_fields,
+        enabled=cfg.redact_sensitive,
+    )
     full_path = f"{request.path}?{query_string}" if query_string else request.path
 
     captured = CapturedRequest(

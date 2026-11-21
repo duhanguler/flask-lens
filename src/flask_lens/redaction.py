@@ -49,6 +49,60 @@ def redact_headers(
     return result
 
 
+def redact_query_string(
+    query_string: str,
+    sensitive_fields: frozenset[str],
+    *,
+    enabled: bool = True,
+) -> str:
+    """Redact sensitive key/value pairs inside a URL query string."""
+    if not enabled or not query_string:
+        return query_string
+    pairs = urllib.parse.parse_qsl(query_string, keep_blank_values=True)
+    if not pairs:
+        return query_string
+    changed = False
+    cleaned: list[tuple[str, str]] = []
+    for k, v in pairs:
+        if is_sensitive_key(k, sensitive_fields):
+            cleaned.append((k, REDACTED))
+            changed = True
+        else:
+            cleaned.append((k, v))
+    if not changed:
+        return query_string
+    return urllib.parse.urlencode(cleaned)
+
+
+def redact_url(
+    url: str,
+    sensitive_fields: frozenset[str],
+    *,
+    enabled: bool = True,
+) -> str:
+    """Redact userinfo credentials and sensitive query parameters in a full URL."""
+    if not enabled or not url:
+        return url
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+
+    netloc = parts.netloc
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+        if ":" in userinfo:
+            user, _pwd = userinfo.split(":", 1)
+            netloc = f"{user}:{REDACTED}@{hostport}"
+        else:
+            netloc = f"{REDACTED}@{hostport}"
+
+    query = redact_query_string(parts.query, sensitive_fields, enabled=True)
+    if netloc == parts.netloc and query == parts.query:
+        return url
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
 def redact_data(
     value: Any,
     sensitive_fields: frozenset[str],

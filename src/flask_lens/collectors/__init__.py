@@ -17,7 +17,11 @@ from flask_lens.collectors.http_outgoing import (
     install_http_hooks,
     uninstall_http_hooks,
 )
-from flask_lens.collectors.logging_handler import LensLogHandler
+from flask_lens.collectors.logging_handler import (
+    LensLogHandler,
+    install_log_handler,
+    uninstall_log_handler,
+)
 from flask_lens.collectors.profiler import RequestProfiler
 
 __all__ = [
@@ -28,10 +32,12 @@ __all__ = [
     "event",
     "get_active_request",
     "install_http_hooks",
+    "install_log_handler",
     "is_capture_suspended",
     "reset_active_request",
     "set_active_request",
     "span",
     "suspend_capture",
     "uninstall_http_hooks",
+    "uninstall_log_handler",
 ]

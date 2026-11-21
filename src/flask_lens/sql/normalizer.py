@@ -10,6 +10,7 @@ _SQL_TOKEN_RE = re.compile(
     r"""
     (?P<block_comment>/\*[\s\S]*?\*/) |
     (?P<line_comment>--[^\n]*) |
+    (?P<pg_escape_str>[eE]'(?:''|\\.|[^'\\])*') |
     (?P<single_str>'(?:''|\\'|[^'])*') |
     (?P<dollar_param>\$\d+) |
     (?P<pyformat_param>%\([A-Za-z_][A-Za-z0-9_]*\)s) |
@@ -21,18 +22,22 @@ _SQL_TOKEN_RE = re.compile(
     re.VERBOSE,
 )
 
-_IN_LIST_RE = re.compile(r"\bIN\s*\(\s*\?(?:\s*,\s*\?)*\s*\)", re.IGNORECASE)
+_IN_LIST_RE = re.compile(
+    r"\bIN\s*\(\s*(?:\?|NULL)(?:\s*,\s*(?:\?|NULL))*\s*\)",
+    re.IGNORECASE,
+)
 _VALUES_LIST_RE = re.compile(
-    r"\bVALUES\s*(\(\s*\?(?:\s*,\s*\?)*\s*\))(?:\s*,\s*\(\s*\?(?:\s*,\s*\?)*\s*\))+",
+    r"\bVALUES\s*(\(\s*(?:\?|NULL)(?:\s*,\s*(?:\?|NULL))*\s*\))(?:\s*,\s*\(\s*(?:\?|NULL)(?:\s*,\s*(?:\?|NULL))*\s*\))+",
     re.IGNORECASE,
 )
 _WHITESPACE_RE = re.compile(r"\s+")
 
+_IDENT_PART = r'(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)'
 _TABLE_RE = re.compile(
-    r"""
+    rf"""
     \b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+
     (?:ONLY\s+)?
-    (?:"([^"]+)"|`([^`]+)`|\[([^\]]+)\]|([A-Za-z_][A-Za-z0-9_.]*))
+    (?P<table>{_IDENT_PART}(?:\.{_IDENT_PART})?)
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -76,14 +81,25 @@ def _replace_token(match: re.Match[str]) -> str:
     return "?"
 
 
+def strip_comments_and_strings(sql: str) -> str:
+    """Replace SQL comments and string literals with whitespace for safe structural inspection."""
+
+    def _blank(match: re.Match[str]) -> str:
+        if match.lastgroup in {"block_comment", "line_comment", "single_str", "pg_escape_str"}:
+            return " "
+        return match.group(0)
+
+    return _SQL_TOKEN_RE.sub(_blank, sql)
+
+
 def classify_operation(sql: str) -> str:
     """Classify SQL into SELECT, INSERT, UPDATE, DELETE, TRANSACTION, DDL, or OTHER."""
-    stripped = _strip_leading_comments(sql).strip()
-    if not stripped:
+    cleaned = strip_comments_and_strings(sql).strip()
+    if not cleaned:
         return "OTHER"
-    first = stripped.split(None, 1)[0].upper()
+    first = cleaned.split(None, 1)[0].upper()
     if first == "WITH":
-        upper = stripped.upper()
+        upper = cleaned.upper()
         for verb in ("INSERT", "UPDATE", "DELETE", "SELECT"):
             if re.search(rf"\)\s*{verb}\b", upper):
                 return verb
@@ -98,20 +114,24 @@ def classify_operation(sql: str) -> str:
 
 
 def extract_tables(sql: str) -> list[str]:
-    """Extract unique referenced table names in appearance order."""
+    """Extract unique referenced table names (including schema.table) in appearance order."""
     tables: list[str] = []
     seen: set[str] = set()
-    cleaned = _strip_comments_and_strings(sql)
+    cleaned = strip_comments_and_strings(sql)
     for match in _TABLE_RE.finditer(cleaned):
-        raw = next((group for group in match.groups() if group), "")
-        if not raw:
+        raw_expr = match.group("table")
+        if not raw_expr:
             continue
-        leaf = raw.split(".")[-1].lower()
+        parts = [_unquote_ident(p) for p in _split_qualified_ident(raw_expr)]
+        normalized_table = ".".join(p for p in parts if p)
+        if not normalized_table:
+            continue
+        leaf = parts[-1].lower()
         if leaf in _SQL_KEYWORDS_NOT_TABLES:
             continue
-        if raw not in seen:
-            seen.add(raw)
-            tables.append(raw)
+        if normalized_table not in seen:
+            seen.add(normalized_table)
+            tables.append(normalized_table)
     return tables
 
 
@@ -132,23 +152,33 @@ def normalize_sql(sql: str) -> NormalizedSQL:
     )
 
 
-def _strip_leading_comments(sql: str) -> str:
-    s = sql.lstrip()
-    while True:
-        if s.startswith("--"):
-            nl = s.find("\n")
-            s = "" if nl == -1 else s[nl + 1 :].lstrip()
-        elif s.startswith("/*"):
-            end = s.find("*/")
-            s = "" if end == -1 else s[end + 2 :].lstrip()
+def _split_qualified_ident(expr: str) -> list[str]:
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    for ch in expr:
+        if quote is not None:
+            buf.append(ch)
+            if (quote == "[" and ch == "]") or (quote in {'"', "`"} and ch == quote):
+                quote = None
+        elif ch in {'"', "`", "["}:
+            quote = ch
+            buf.append(ch)
+        elif ch == ".":
+            parts.append("".join(buf))
+            buf = []
         else:
-            return s
+            buf.append(ch)
+    if buf:
+        parts.append("".join(buf))
+    return parts
 
 
-def _strip_comments_and_strings(sql: str) -> str:
-    def _blank(match: re.Match[str]) -> str:
-        if match.lastgroup in {"block_comment", "line_comment", "single_str"}:
-            return " "
-        return match.group(0)
-
-    return _SQL_TOKEN_RE.sub(_blank, sql)
+def _unquote_ident(ident: str) -> str:
+    if len(ident) >= 2 and (
+        (ident[0] == '"' and ident[-1] == '"')
+        or (ident[0] == "`" and ident[-1] == "`")
+        or (ident[0] == "[" and ident[-1] == "]")
+    ):
+        return ident[1:-1]
+    return ident

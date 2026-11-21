@@ -219,17 +219,20 @@ class SQLiteStorage:
             where_clauses.append("duration_ms >= ?")
             params.append(flt.min_duration_ms)
         if flt.search:
-            like = f"%{flt.search}%"
+            escaped = flt.search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{escaped}%"
             where_clauses.append(
                 """
                 (
-                    path LIKE ? OR full_path LIKE ? OR COALESCE(endpoint, '') LIKE ?
-                    OR COALESCE(rule, '') LIKE ? OR COALESCE(exc_type, '') LIKE ?
-                    OR COALESCE(exc_message, '') LIKE ?
+                    path LIKE ? ESCAPE '\\' OR full_path LIKE ? ESCAPE '\\'
+                    OR COALESCE(endpoint, '') LIKE ? ESCAPE '\\'
+                    OR COALESCE(rule, '') LIKE ? ESCAPE '\\'
+                    OR COALESCE(exc_type, '') LIKE ? ESCAPE '\\'
+                    OR COALESCE(exc_message, '') LIKE ? ESCAPE '\\'
                     OR EXISTS (
                         SELECT 1 FROM lens_sql_queries q
                         WHERE q.request_id = lens_requests.id
-                          AND q.normalized_sql LIKE ?
+                          AND q.normalized_sql LIKE ? ESCAPE '\\'
                     )
                 )
                 """
@@ -412,20 +415,34 @@ class SQLiteStorage:
             rows = self._conn.execute(
                 """
                 SELECT
-                    fingerprint,
-                    MAX(normalized_sql) AS normalized_sql,
-                    MAX(operation) AS operation,
-                    MAX(tables_json) AS tables_json,
+                    q.fingerprint,
+                    MAX(q.normalized_sql) AS normalized_sql,
+                    MAX(q.operation) AS operation,
+                    MAX(q.tables_json) AS tables_json,
                     COUNT(*) AS calls,
-                    SUM(duration_ms) AS total_ms,
-                    AVG(duration_ms) AS avg_ms,
-                    MAX(duration_ms) AS max_ms,
-                    SUM(is_slow) AS slow_hits,
-                    SUM(is_n_plus_one) AS n_plus_one_hits,
-                    MAX(request_id) AS sample_request_id,
-                    MAX(call_site) AS sample_call_site
-                FROM lens_sql_queries
-                GROUP BY fingerprint
+                    SUM(q.duration_ms) AS total_ms,
+                    AVG(q.duration_ms) AS avg_ms,
+                    MAX(q.duration_ms) AS max_ms,
+                    SUM(q.is_slow) AS slow_hits,
+                    SUM(q.is_n_plus_one) AS n_plus_one_hits,
+                    (
+                        SELECT q2.request_id
+                        FROM lens_sql_queries q2
+                        JOIN lens_requests r2 ON r2.id = q2.request_id
+                        WHERE q2.fingerprint = q.fingerprint
+                        ORDER BY r2.seq DESC
+                        LIMIT 1
+                    ) AS sample_request_id,
+                    (
+                        SELECT q2.call_site
+                        FROM lens_sql_queries q2
+                        JOIN lens_requests r2 ON r2.id = q2.request_id
+                        WHERE q2.fingerprint = q.fingerprint
+                        ORDER BY r2.seq DESC
+                        LIMIT 1
+                    ) AS sample_call_site
+                FROM lens_sql_queries q
+                GROUP BY q.fingerprint
                 ORDER BY total_ms DESC, calls DESC
                 LIMIT ?
                 """,

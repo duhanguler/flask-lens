@@ -10,7 +10,7 @@ from typing import Any
 
 from flask_lens.collectors.context import get_active_request, is_capture_suspended
 from flask_lens.models import OutgoingHTTP
-from flask_lens.redaction import redact_headers
+from flask_lens.redaction import redact_headers, redact_url
 
 _LOCK = threading.Lock()
 _REF_COUNT = 0
@@ -89,7 +89,11 @@ def _install_urllib3() -> None:
         scheme = getattr(self, "scheme", "http")
         host = getattr(self, "host", "")
         port = getattr(self, "port", None)
-        full_url = _build_urllib3_url(scheme, host, port, url)
+        full_url = redact_url(
+            _build_urllib3_url(scheme, host, port, url),
+            ctx.config.sensitive_fields,
+            enabled=ctx.config.redact_sensitive,
+        )
         raw_req_headers = kwargs.get("headers") or {}
         req_headers = redact_headers(
             {str(k): str(v) for k, v in dict(raw_req_headers).items()},
@@ -153,7 +157,11 @@ def _install_httpx() -> None:
         if ctx is None or is_capture_suspended() or not ctx.config.capture_outgoing_http:
             return orig_send(self, request, *args, **kwargs)
 
-        url_str = str(request.url)
+        url_str = redact_url(
+            str(request.url),
+            ctx.config.sensitive_fields,
+            enabled=ctx.config.redact_sensitive,
+        )
         host = str(getattr(request.url, "host", ""))
         req_headers = redact_headers(
             dict(request.headers.items()),
@@ -200,7 +208,11 @@ def _install_httpx() -> None:
         if ctx is None or is_capture_suspended() or not ctx.config.capture_outgoing_http:
             return await orig_async_send(self, request, *args, **kwargs)
 
-        url_str = str(request.url)
+        url_str = redact_url(
+            str(request.url),
+            ctx.config.sensitive_fields,
+            enabled=ctx.config.redact_sensitive,
+        )
         host = str(getattr(request.url, "host", ""))
         req_headers = redact_headers(
             dict(request.headers.items()),

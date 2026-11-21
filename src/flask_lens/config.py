@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -108,14 +108,49 @@ class LensConfig:
     # Project root hint for classifying "user code" vs third-party/stdlib frames
     app_root: str | None = None
 
+    def __post_init__(self) -> None:
+        self.ignore_paths = _coerce_field("ignore_paths", self.ignore_paths)
+        self.ignore_methods = tuple(
+            str(m).upper() for m in _coerce_field("ignore_methods", self.ignore_methods)
+        )
+        self.sensitive_headers = _coerce_field("sensitive_headers", self.sensitive_headers)
+        self.sensitive_fields = _coerce_field("sensitive_fields", self.sensitive_fields)
+
+        if not self.url_prefix.startswith("/"):
+            self.url_prefix = "/" + self.url_prefix
+        self.url_prefix = self.url_prefix.rstrip("/") or "/__lens"
+
+        if not (0.0 <= self.sample_rate <= 1.0):
+            raise ValueError("sample_rate must be between 0.0 and 1.0")
+        if self.max_requests < 1:
+            raise ValueError("max_requests must be >= 1")
+        if self.n_plus_one_threshold < 2:
+            raise ValueError("n_plus_one_threshold must be >= 2")
+        if self.slow_query_ms < 0:
+            raise ValueError("slow_query_ms must be >= 0")
+        if self.profile_mode not in {"off", "on_demand", "slow", "always"}:
+            raise ValueError(
+                f"Invalid profile_mode {self.profile_mode!r}; "
+                "expected 'off', 'on_demand', 'slow', or 'always'"
+            )
+        if self.storage not in {"sqlite", "memory"}:
+            raise ValueError(f"Invalid storage {self.storage!r}; expected 'sqlite' or 'memory'")
+
+    def copy_with(self, **overrides: Any) -> LensConfig:
+        """Return a validated copy of this config with *overrides* applied."""
+        for key in overrides:
+            if not hasattr(self, key):
+                raise ValueError(f"Unknown LensConfig option: {key!r}")
+        coerced = {k: _coerce_field(k, v) for k, v in overrides.items()}
+        return replace(self, **coerced)
+
     @classmethod
     def from_flask_config(
         cls,
         app: Flask,
         overrides: dict[str, Any] | None = None,
     ) -> LensConfig:
-        """Build a :class:`LensConfig` by reading ``LENS_*`` keys from ``app.config``."""
-        cfg = cls()
+        """Build a validated :class:`LensConfig` from ``app.config['LENS_*']`` and overrides."""
         mapping: dict[str, str] = {
             "LENS_ENABLED": "enabled",
             "LENS_URL_PREFIX": "url_prefix",
@@ -150,34 +185,21 @@ class LensConfig:
             "LENS_SENSITIVE_FIELDS": "sensitive_fields",
             "LENS_APP_ROOT": "app_root",
         }
+        kwargs: dict[str, Any] = {}
         for flask_key, attr in mapping.items():
             if flask_key in app.config:
-                value = app.config[flask_key]
-                setattr(cfg, attr, _coerce_field(attr, value))
+                kwargs[attr] = _coerce_field(attr, app.config[flask_key])
 
         if overrides:
             for key, value in overrides.items():
-                if not hasattr(cfg, key):
+                if not hasattr(cls, key):
                     raise ValueError(f"Unknown LensConfig option: {key!r}")
-                setattr(cfg, key, _coerce_field(key, value))
+                kwargs[key] = _coerce_field(key, value)
 
-        if not cfg.url_prefix.startswith("/"):
-            cfg.url_prefix = "/" + cfg.url_prefix
-        cfg.url_prefix = cfg.url_prefix.rstrip("/") or "/__lens"
+        if "app_root" not in kwargs and getattr(app, "root_path", None):
+            kwargs["app_root"] = app.root_path
 
-        if cfg.app_root is None and getattr(app, "root_path", None):
-            cfg.app_root = app.root_path
-
-        if not (0.0 <= cfg.sample_rate <= 1.0):
-            raise ValueError("sample_rate must be between 0.0 and 1.0")
-        if cfg.profile_mode not in {"off", "on_demand", "slow", "always"}:
-            raise ValueError(
-                f"Invalid profile_mode {cfg.profile_mode!r}; expected 'off', 'on_demand', 'slow', or 'always'"
-            )
-        if cfg.storage not in {"sqlite", "memory"}:
-            raise ValueError(f"Invalid storage {cfg.storage!r}; expected 'sqlite' or 'memory'")
-
-        return cfg
+        return cls(**kwargs)
 
 
 def _coerce_field(attr: str, value: Any) -> Any:

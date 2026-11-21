@@ -54,9 +54,15 @@ Installing `flask-lens` registers the `flask_lens` `pytest11` plugin automatical
 import pytest
 
 
-@pytest.mark.max_queries(2)
+@pytest.mark.num_queries(2)
 @pytest.mark.no_n_plus_one
-def test_authors_list_is_fast(client, db):
+def test_authors_list_exact(client, db):
+    resp = client.get("/api/authors?optimized=1")
+    assert resp.status_code == 200
+
+
+@pytest.mark.max_queries(3)
+def test_authors_list_bounded(client, db):
     resp = client.get("/api/authors?optimized=1")
     assert resp.status_code == 200
 ```

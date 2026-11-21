@@ -52,6 +52,17 @@
     return Number(val || 0).toLocaleString("en-US");
   }
 
+  function fmtSigned(val, decimals = 2) {
+    const n = Number(val || 0);
+    const fixed = Math.abs(n) < 1e-9 ? (0).toFixed(decimals) : n.toFixed(decimals);
+    return n > 1e-9 ? `+${fixed}` : fixed;
+  }
+
+  function fmtSignedInt(val) {
+    const n = Number(val || 0);
+    return n > 0 ? `+${n}` : `${n}`;
+  }
+
   function renderInlineCode(text) {
     return esc(text).replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
   }
@@ -291,7 +302,7 @@
               <div class="req-tags">${tags.join("")}</div>
               <div class="mono">
                 <span>${fmtMs(req.duration_ms)}</span>
-                <span class="muted"> · ${fmtRelative(req.timestamp)}</span>
+                <span class="muted" data-ts="${esc(req.timestamp)}"> · ${fmtRelative(req.timestamp)}</span>
               </div>
             </div>
           </div>`;
@@ -304,6 +315,9 @@
     state.flameZoomNode = null;
     state.selectedExcFrame = -1;
     renderRequestList();
+    if (state.view === "requests" && id) {
+      window.history?.replaceState?.(null, "", `${BASE}/requests/${encodeURIComponent(id)}`);
+    }
 
     try {
       const detail = await apiFetch(`/api/requests/${encodeURIComponent(id)}`);
@@ -612,6 +626,7 @@
               </div>
               <div class="sql-card-head-right">
                 <span class="mono" style="font-weight:600">${fmtMs(q.duration_ms)}</span>
+                <button class="btn sm copy-sql-btn" data-qid="${esc(q.id)}">Copy</button>
                 ${q.operation === "SELECT" ? `<button class="btn sm explain-btn" data-qid="${esc(q.id)}">EXPLAIN</button>` : ""}
                 ${q.stack && q.stack.length ? `<button class="btn sm stack-btn" data-qid="${esc(q.id)}">${stackOpen ? "Hide Source" : "Source"}</button>` : ""}
               </div>
@@ -665,6 +680,17 @@
       btn.addEventListener("click", () => {
         state.sqlFilter = btn.dataset.sqlfilter;
         renderSqlTab(container, req);
+      });
+    });
+
+    $$(".copy-sql-btn", container).forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const q = queries.find((item) => item.id === btn.dataset.qid);
+        if (!q) return;
+        navigator.clipboard?.writeText(q.sql).then(
+          () => showToast("Copied SQL query to clipboard"),
+          () => showToast("Copy failed — clipboard permission required")
+        );
       });
     });
 
@@ -1301,23 +1327,22 @@
       const d = diff.deltas;
       const durClass = d.duration_ms <= 0 ? "delta-good" : "delta-bad";
       const sqlClass = d.sql_count <= 0 ? "delta-good" : "delta-bad";
-      const sign = (n) => (n > 0 ? `+${n}` : `${n}`);
 
       out.innerHTML = `
         <div class="delta-grid">
           <div class="delta-card">
             <div class="metric-label">Latency Delta</div>
-            <div class="delta-val mono ${durClass}">${sign(d.duration_ms.toFixed(2))}ms (${sign(d.duration_pct)}%)</div>
+            <div class="delta-val mono ${durClass}">${fmtSigned(d.duration_ms, 2)}ms (${fmtSigned(d.duration_pct, 1)}%)</div>
             <div class="mono muted">${fmtMs(diff.baseline.duration_ms)} → ${fmtMs(diff.candidate.duration_ms)}</div>
           </div>
           <div class="delta-card">
             <div class="metric-label">SQL Query Count</div>
-            <div class="delta-val mono ${sqlClass}">${sign(d.sql_count)} queries</div>
+            <div class="delta-val mono ${sqlClass}">${fmtSignedInt(d.sql_count)} queries</div>
             <div class="mono muted">${diff.baseline.sql_count} → ${diff.candidate.sql_count}</div>
           </div>
           <div class="delta-card">
             <div class="metric-label">SQL Time Delta</div>
-            <div class="delta-val mono ${d.sql_duration_ms <= 0 ? "delta-good" : "delta-bad"}">${sign(d.sql_duration_ms.toFixed(2))}ms</div>
+            <div class="delta-val mono ${d.sql_duration_ms <= 0 ? "delta-good" : "delta-bad"}">${fmtSigned(d.sql_duration_ms, 2)}ms</div>
             <div class="mono muted">${fmtMs(diff.baseline.sql_duration_ms)} → ${fmtMs(diff.candidate.sql_duration_ms)}</div>
           </div>
           <div class="delta-card">
@@ -1362,7 +1387,7 @@
                       <td class="mono" style="max-width:560px;word-break:break-word">${highlightSQL(q.normalized_sql)}</td>
                       <td class="num mono">${q.baseline_count}× (${fmtMs(q.baseline_ms)})</td>
                       <td class="num mono">${q.candidate_count}× (${fmtMs(q.candidate_ms)})</td>
-                      <td class="num mono ${q.delta_count <= 0 ? "delta-good" : "delta-bad"}">${sign(q.delta_count)}</td>
+                      <td class="num mono ${q.delta_count <= 0 ? "delta-good" : "delta-bad"}">${fmtSignedInt(q.delta_count)}</td>
                     </tr>`;
                 })
                 .join("")}
@@ -1480,10 +1505,14 @@
 
   // ── Command Palette (Cmd/Ctrl+K) ───────────────────────────────────────
 
+  let cmdkItems = [];
+  let cmdkActiveIdx = 0;
+
   function openCmdK() {
     $("#cmdk-modal").classList.remove("hidden");
     const input = $("#cmdk-input");
     input.value = "";
+    cmdkActiveIdx = 0;
     renderCmdKList("");
     input.focus();
   }
@@ -1514,16 +1543,22 @@
       },
     }));
 
-    const items = [...actions, ...reqMatches].filter(
-      (it) => !q || it.label.toLowerCase().includes(q) || it.hint.toLowerCase().includes(q)
-    );
+    cmdkItems = [...actions, ...reqMatches]
+      .filter((it) => !q || it.label.toLowerCase().includes(q) || it.hint.toLowerCase().includes(q))
+      .slice(0, 14);
+
+    if (cmdkActiveIdx >= cmdkItems.length) cmdkActiveIdx = 0;
 
     const list = $("#cmdk-list");
-    list.innerHTML = items
-      .slice(0, 14)
+    if (!cmdkItems.length) {
+      list.innerHTML = `<div class="empty-state" style="padding:18px">No matching commands or requests</div>`;
+      return;
+    }
+
+    list.innerHTML = cmdkItems
       .map(
         (it, idx) => `
-        <div class="cmdk-item ${idx === 0 ? "active" : ""}" data-idx="${idx}">
+        <div class="cmdk-item ${idx === cmdkActiveIdx ? "active" : ""}" data-idx="${idx}">
           <span class="mono" style="font-size:12.5px">${esc(it.label)}</span>
           <span class="muted mono" style="font-size:11px">${esc(it.hint)}</span>
         </div>`
@@ -1532,9 +1567,18 @@
 
     $$(".cmdk-item", list).forEach((el) => {
       el.addEventListener("click", () => {
-        items[Number(el.dataset.idx)].run();
+        cmdkItems[Number(el.dataset.idx)].run();
         closeCmdK();
       });
+    });
+  }
+
+  function updateCmdKSelection(delta) {
+    if (!cmdkItems.length) return;
+    cmdkActiveIdx = (cmdkActiveIdx + delta + cmdkItems.length) % cmdkItems.length;
+    $$(".cmdk-item", $("#cmdk-list")).forEach((el, idx) => {
+      el.classList.toggle("active", idx === cmdkActiveIdx);
+      if (idx === cmdkActiveIdx) el.scrollIntoView({ block: "nearest" });
     });
   }
 
@@ -1548,8 +1592,10 @@
       try {
         const summary = JSON.parse(ev.data);
         if (matchesCurrentFilters(summary)) {
+          const hadNone = !state.selectedId && state.requests.length === 0;
           state.requests = [summary, ...state.requests.filter((r) => r.id !== summary.id)].slice(0, 150);
           renderRequestList();
+          if (hadNone) selectRequest(summary.id);
         }
         loadOverview();
       } catch (err) {
@@ -1595,10 +1641,19 @@
 
   // ── Navigation & Actions ───────────────────────────────────────────────
 
-  function switchView(viewName) {
+  function switchView(viewName, syncUrl = true) {
     state.view = viewName;
     $$(".nav-tab").forEach((t) => t.classList.toggle("active", t.dataset.view === viewName));
     $$(".view").forEach((v) => v.classList.toggle("active", v.id === `view-${viewName}`));
+    if (syncUrl && window.history?.replaceState) {
+      const targetUrl =
+        viewName === "requests"
+          ? state.selectedId
+            ? `${BASE}/requests/${encodeURIComponent(state.selectedId)}`
+            : `${BASE}/`
+          : `${BASE}/${viewName}`;
+      window.history.replaceState(null, "", targetUrl);
+    }
     if (viewName === "endpoints") loadEndpoints();
     if (viewName === "sql") loadSqlExplorer();
     if (viewName === "exceptions") loadExceptions();
@@ -1693,7 +1748,25 @@
     });
 
     // Command palette
-    $("#cmdk-input").addEventListener("input", (e) => renderCmdKList(e.target.value));
+    $("#cmdk-input").addEventListener("input", (e) => {
+      cmdkActiveIdx = 0;
+      renderCmdKList(e.target.value);
+    });
+    $("#cmdk-input").addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        updateCmdKSelection(1);
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        updateCmdKSelection(-1);
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (cmdkItems[cmdkActiveIdx]) {
+          cmdkItems[cmdkActiveIdx].run();
+          closeCmdK();
+        }
+      }
+    });
     $("#cmdk-modal").addEventListener("click", (e) => {
       if (e.target.id === "cmdk-modal") closeCmdK();
     });
@@ -1728,8 +1801,29 @@
 
   // ── Bootstrap ──────────────────────────────────────────────────────────
 
+  function applyInitialRoute() {
+    const path = window.location.pathname || "";
+    const rel = path.startsWith(BASE) ? path.slice(BASE.length).replace(/^\/+|\/+$/g, "") : "";
+    if (["endpoints", "sql", "exceptions", "compare"].includes(rel)) {
+      switchView(rel, false);
+    } else if (rel.startsWith("requests/")) {
+      const reqId = decodeURIComponent(rel.slice("requests/".length));
+      if (reqId) {
+        state.selectedId = reqId;
+        selectRequest(reqId);
+      }
+    }
+  }
+
   initTheme();
   bindEvents();
+  applyInitialRoute();
   refreshAll();
   startSSE();
+
+  setInterval(() => {
+    $$("[data-ts]").forEach((el) => {
+      el.textContent = ` · ${fmtRelative(el.dataset.ts)}`;
+    });
+  }, 15000);
 })();

@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from flask_lens.sql.normalizer import classify_operation
+from flask_lens.sql.normalizer import classify_operation, strip_comments_and_strings
+
+_MUTATING_KEYWORD_RE = re.compile(
+    r"\b(?:INSERT|UPDATE|DELETE|MERGE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|PRAGMA|ATTACH|DETACH|VACUUM|CALL|COPY)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -25,14 +31,30 @@ class ExplainResult:
 
 def is_safe_explainable_sql(sql: str) -> tuple[bool, str | None]:
     """Validate that *sql* is a single read-only SELECT query safe for EXPLAIN."""
-    stripped = sql.strip().rstrip(";").strip()
+    stripped = sql.strip()
     if not stripped:
         return False, "Empty SQL statement."
-    if _contains_top_level_semicolon(stripped):
+    # Reject unclosed block comments so malicious trailing payloads can't hide
+    if _has_unclosed_block_comment(stripped):
+        return False, "Unclosed SQL block comment is not permitted for EXPLAIN."
+
+    # Strip comments & string literals before structural checks
+    structural = strip_comments_and_strings(stripped).strip()
+    if structural.endswith(";"):
+        structural = structural[:-1].strip()
+    if not structural:
+        return False, "Empty SQL statement."
+    if ";" in structural:
         return False, "Multi-statement SQL is not permitted for EXPLAIN."
+
     op = classify_operation(stripped)
     if op != "SELECT":
         return False, f"EXPLAIN is restricted to read-only SELECT queries (got {op})."
+
+    # Also reject data-modifying CTEs like: WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d
+    if _MUTATING_KEYWORD_RE.search(structural):
+        return False, "Data-modifying or DDL statements inside CTEs are not permitted for EXPLAIN."
+
     return True, None
 
 
@@ -130,21 +152,45 @@ def _extract_plan_warnings(dialect: str, lines: list[str]) -> list[str]:
     return warnings
 
 
-def _contains_top_level_semicolon(sql: str) -> bool:
+def _has_unclosed_block_comment(sql: str) -> bool:
     in_single = False
     in_double = False
+    in_line_comment = False
+    in_block_comment = False
     i = 0
     n = len(sql)
     while i < n:
         ch = sql[i]
-        if ch == "'" and not in_double:
-            if in_single and i + 1 < n and sql[i + 1] == "'":
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+        elif in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
                 i += 2
                 continue
-            in_single = not in_single
-        elif ch == '"' and not in_single:
-            in_double = not in_double
-        elif ch == ";" and not in_single and not in_double:
-            return True
+        elif in_single:
+            if ch == "'" and nxt == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                in_double = False
+        else:
+            if ch == "-" and nxt == "-":
+                in_line_comment = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
         i += 1
-    return False
+    return in_block_comment

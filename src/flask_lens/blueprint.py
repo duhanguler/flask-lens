@@ -8,12 +8,13 @@ import queue
 from collections.abc import Iterator
 from typing import Any
 
-from flask import Blueprint, Response, current_app, jsonify, request, send_from_directory
+from flask import Blueprint, Response, abort, current_app, jsonify, request, send_from_directory
 
-from flask_lens.extension import LensState
+from flask_lens.extension import STREAM_STOP, LensState
 from flask_lens.storage.base import RequestFilter, compute_request_diff
 
 _UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui")
+_ALLOWED_UI_ASSETS: frozenset[str] = frozenset({"styles.css", "app.js"})
 
 
 def _get_state() -> LensState:
@@ -62,18 +63,22 @@ def create_lens_blueprint() -> Blueprint:
 
     @bp.route("/assets/<path:filename>")
     def ui_asset(filename: str) -> Response:
+        if filename not in _ALLOWED_UI_ASSETS:
+            abort(404)
         return send_from_directory(_UI_DIR, filename)
 
     # ── Telemetry REST API ────────────────────────────────────────────────
 
     @bp.get("/api/health")
     def api_health() -> Response:
+        from flask_lens import __version__
+
         state = _get_state()
         cfg = state.config
         return jsonify(
             {
                 "status": "ok",
-                "version": "0.1.0",
+                "version": __version__,
                 "url_prefix": cfg.url_prefix,
                 "storage": cfg.storage,
                 "profile_mode": cfg.profile_mode,
@@ -217,6 +222,8 @@ def create_lens_blueprint() -> Blueprint:
                         break
                     try:
                         item = sub_queue.get(timeout=15.0)
+                        if item is STREAM_STOP:
+                            break
                         payload = json.dumps(item, ensure_ascii=False)
                         yield f"event: request\ndata: {payload}\n\n"
                         sent += 1

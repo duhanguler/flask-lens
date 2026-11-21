@@ -243,6 +243,13 @@ def _build_flamegraph(
     }
 
 
+def _is_within(path: str, directory: str) -> bool:
+    try:
+        return os.path.commonpath([path, directory]) == directory
+    except ValueError:
+        return False
+
+
 def classify_frame(filename: str, app_root: str | None) -> str:
     """Classify a filename as 'user', 'framework', 'stdlib', or 'third_party'."""
     if not filename or filename.startswith("<") or filename == "~":
@@ -252,9 +259,9 @@ def classify_frame(filename: str, app_root: str | None) -> str:
         return "framework"
     if "site-packages" in abs_path or "dist-packages" in abs_path:
         return "third_party"
-    if any(abs_path.startswith(prefix) for prefix in _STDLIB_DIRS):
+    if any(_is_within(abs_path, os.path.abspath(prefix)) for prefix in _STDLIB_DIRS):
         return "stdlib"
-    if app_root and abs_path.startswith(app_root):
+    if app_root and _is_within(abs_path, app_root):
         return "user"
     return "user"
 
@@ -265,7 +272,7 @@ def shorten_filename(filename: str, app_root: str | None) -> str:
     if filename.startswith("<"):
         return filename
     abs_path = os.path.abspath(filename)
-    if app_root and abs_path.startswith(app_root):
+    if app_root and _is_within(abs_path, app_root):
         return os.path.relpath(abs_path, app_root)
     parts = abs_path.split(os.sep)
     if len(parts) > 3:
