@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="lens-base-url" content="__LENS_BASE_URL__" />
+  <title>flask-lens — Developer Observability</title>
+  <link rel="stylesheet" href="__LENS_BASE_URL__/assets/styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <!-- Top Bar -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <a href="__LENS_BASE_URL__/" class="brand" id="brand-home">
+          <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9"></circle>
+            <circle cx="12" cy="12" r="3.5"></circle>
+            <line x1="12" y1="3" x2="12" y2="6"></line>
+            <line x1="12" y1="18" x2="12" y2="21"></line>
+            <line x1="3" y1="12" x2="6" y2="12"></line>
+            <line x1="18" y1="12" x2="21" y2="12"></line>
+          </svg>
+          <span class="brand-name">flask-lens</span>
+        </a>
+        <button id="live-toggle" class="live-pill active" title="Toggle live SSE stream">
+          <span class="live-dot"></span>
+          <span id="live-label">Live</span>
+        </button>
+      </div>
+
+      <nav class="nav-tabs" role="tablist" aria-label="Primary views">
+        <button class="nav-tab active" data-view="requests" role="tab">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/></svg>
+          <span>Requests</span>
+          <span class="tab-count" id="nav-count-requests">0</span>
+        </button>
+        <button class="nav-tab" data-view="endpoints" role="tab">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12l4-4 3 3 5-7"/></svg>
+          <span>Endpoints</span>
+        </button>
+        <button class="nav-tab" data-view="sql" role="tab">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><ellipse cx="8" cy="3.5" rx="5.5" ry="2"/><path d="M2.5 3.5v9c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2v-9M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></svg>
+          <span>SQL Explorer</span>
+        </button>
+        <button class="nav-tab" data-view="exceptions" role="tab">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 2L1.5 13.5h13L8 2zM8 6.5v3M8 11.5h.01"/></svg>
+          <span>Exceptions</span>
+          <span class="tab-count danger hidden" id="nav-count-exceptions">0</span>
+        </button>
+        <button class="nav-tab" data-view="compare" role="tab">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 5h5M2 11h5M9 5h5M9 11h5M8 2v12"/></svg>
+          <span>Compare</span>
+        </button>
+      </nav>
+
+      <div class="topbar-right">
+        <button id="cmdk-btn" class="cmdk-trigger" title="Command Palette (Cmd/Ctrl+K)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
+          <span>Search</span>
+          <kbd>⌘K</kbd>
+        </button>
+        <button id="theme-btn" class="icon-btn" title="Toggle theme">
+          <svg id="theme-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13.5 9.5A5.5 5.5 0 016.5 2.5a5.5 5.5 0 107 7z"/></svg>
+        </button>
+        <button id="refresh-btn" class="icon-btn" title="Refresh telemetry (R)">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M13.5 8a5.5 5.5 0 11-1.4-3.7M13.5 2.5v2.8h-2.8"/></svg>
+        </button>
+        <button id="clear-btn" class="icon-btn danger-hover" title="Clear all telemetry">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.7 9h5.6l.7-9"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Compact Metrics Ribbon -->
+    <section class="metrics-ribbon" id="metrics-ribbon">
+      <div class="metric-cell">
+        <span class="metric-label">Requests</span>
+        <span class="metric-value mono" id="kpi-total">0</span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">Avg / P95</span>
+        <span class="metric-value mono"><span id="kpi-avg">0ms</span> <span class="muted">/</span> <span id="kpi-p95">0ms</span></span>
+      </div>
+      <div class="metric-cell">
+        <span class="metric-label">SQL Queries</span>
+        <span class="metric-value mono" id="kpi-sql">0</span>
+      </div>
+      <button class="metric-cell clickable" id="kpi-n1-btn" title="Filter N+1 requests">
+        <span class="metric-label">N+1 Alerts</span>
+        <span class="metric-value mono" id="kpi-n1">0</span>
+      </button>
+      <button class="metric-cell clickable" id="kpi-err-btn" title="Filter error requests">
+        <span class="metric-label">Error Rate</span>
+        <span class="metric-value mono" id="kpi-err">0%</span>
+      </button>
+      <div class="metric-sparkline-wrap">
+        <span class="metric-label">Recent Latency</span>
+        <svg id="latency-sparkline" class="sparkline" viewBox="0 0 220 26" preserveAspectRatio="none"></svg>
+      </div>
+    </section>
+
+    <!-- Main Workspace -->
+    <main class="workspace">
+      <!-- VIEW 1: REQUESTS MASTER-DETAIL -->
+      <section class="view active" id="view-requests">
+        <div class="split-layout">
+          <aside class="request-list-pane">
+            <div class="filter-bar">
+              <div class="search-wrap">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
+                <input id="filter-search" type="text" placeholder="Filter path, endpoint, SQL..." autocomplete="off" />
+              </div>
+              <div class="filter-controls">
+                <select id="filter-method" aria-label="HTTP Method">
+                  <option value="">Method</option>
+                  <option value="GET">GET</option>
+                  <option value="POST">POST</option>
+                  <option value="PUT">PUT</option>
+                  <option value="PATCH">PATCH</option>
+                  <option value="DELETE">DELETE</option>
+                </select>
+                <select id="filter-status" aria-label="HTTP Status">
+                  <option value="">Status</option>
+                  <option value="2xx">2xx</option>
+                  <option value="3xx">3xx</option>
+                  <option value="4xx">4xx</option>
+                  <option value="5xx">5xx</option>
+                </select>
+                <button class="chip-toggle" id="chip-n1" data-filter="n1">N+1</button>
+                <button class="chip-toggle" id="chip-slow" data-filter="slow">Slow</button>
+                <button class="chip-toggle" id="chip-errors" data-filter="errors">Errors</button>
+              </div>
+            </div>
+            <div class="request-list" id="request-list" role="listbox" aria-label="Captured requests">
+              <div class="empty-state">
+                <div class="empty-title">Listening for Flask requests</div>
+                <div class="empty-sub">Send a request to your application and it will stream here in real time.</div>
+              </div>
+            </div>
+          </aside>
+
+          <section class="detail-pane" id="detail-pane">
+            <div class="empty-state full-height">
+              <div class="empty-title">Select a request to inspect</div>
+              <div class="empty-sub">Use <kbd>j</kbd> / <kbd>k</kbd> to step through requests, or press <kbd>⌘K</kbd> to search.</div>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <!-- VIEW 2: ENDPOINTS ANALYTICS -->
+      <section class="view" id="view-endpoints">
+        <div class="panel-scroll">
+          <div class="view-header">
+            <div>
+              <h2>Endpoint Performance</h2>
+              <p class="muted">Latency percentiles, SQL load, N+1 frequency, and error rates grouped by Flask URL rule.</p>
+            </div>
+          </div>
+          <div class="table-card" id="endpoints-table-wrap"></div>
+        </div>
+      </section>
+
+      <!-- VIEW 3: SQL EXPLORER -->
+      <section class="view" id="view-sql">
+        <div class="panel-scroll">
+          <div class="view-header">
+            <div>
+              <h2>SQL Fingerprint Explorer</h2>
+              <p class="muted">Normalized SQL patterns aggregated across all captured requests, ranked by total execution time.</p>
+            </div>
+          </div>
+          <div class="table-card" id="sql-explorer-wrap"></div>
+        </div>
+      </section>
+
+      <!-- VIEW 4: EXCEPTIONS -->
+      <section class="view" id="view-exceptions">
+        <div class="panel-scroll">
+          <div class="view-header">
+            <div>
+              <h2>Captured Exceptions</h2>
+              <p class="muted">Unhandled exceptions grouped by type and deepest application stack frame.</p>
+            </div>
+          </div>
+          <div class="table-card" id="exceptions-wrap"></div>
+        </div>
+      </section>
+
+      <!-- VIEW 5: COMPARE / DIFF -->
+      <section class="view" id="view-compare">
+        <div class="panel-scroll">
+          <div class="view-header">
+            <div>
+              <h2>Request Comparison &amp; Regression Diff</h2>
+              <p class="muted">Compare latency, SQL budgets, and normalized query fingerprints side-by-side.</p>
+            </div>
+          </div>
+          <div class="compare-picker">
+            <div class="picker-col">
+              <label for="compare-baseline">Baseline (Before)</label>
+              <select id="compare-baseline"></select>
+            </div>
+            <div class="picker-arrow">→</div>
+            <div class="picker-col">
+              <label for="compare-candidate">Candidate (After)</label>
+              <select id="compare-candidate"></select>
+            </div>
+            <button id="compare-run-btn" class="btn primary">Compare</button>
+          </div>
+          <div id="compare-result"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Replay Modal -->
+  <div class="modal-backdrop hidden" id="replay-modal">
+    <div class="modal-panel">
+      <div class="modal-header">
+        <h3>Replay Request</h3>
+        <button class="icon-btn" id="replay-close" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row-inline">
+          <select id="replay-method" class="input mono">
+            <option>GET</option>
+            <option>POST</option>
+            <option>PUT</option>
+            <option>PATCH</option>
+            <option>DELETE</option>
+          </select>
+          <input id="replay-path" class="input mono flex-1" type="text" placeholder="/api/..." />
+        </div>
+        <label class="field-label">Headers (JSON)</label>
+        <textarea id="replay-headers" class="input mono code-area" rows="5"></textarea>
+        <label class="field-label">Body</label>
+        <textarea id="replay-body" class="input mono code-area" rows="6" placeholder="Optional request payload"></textarea>
+        <div id="replay-feedback" class="replay-feedback hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" id="replay-cancel">Cancel</button>
+        <button class="btn primary" id="replay-send">Send Request</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command Palette Modal -->
+  <div class="modal-backdrop hidden" id="cmdk-modal">
+    <div class="cmdk-panel">
+      <div class="cmdk-input-wrap">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg>
+        <input id="cmdk-input" type="text" placeholder="Jump to request, view, or command..." autocomplete="off" />
+        <kbd>ESC</kbd>
+      </div>
+      <div class="cmdk-list" id="cmdk-list"></div>
+    </div>
+  </div>
+
+  <!-- Flamegraph Hover Tooltip -->
+  <div id="flame-tooltip" class="flame-tooltip hidden"></div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="__LENS_BASE_URL__/assets/app.js"></script>
+</body>
+</html>

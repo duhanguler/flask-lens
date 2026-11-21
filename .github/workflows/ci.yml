@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+      - name: Install dev dependencies
+        run: uv venv --python 3.12 && uv pip install -e ".[dev]"
+      - name: Ruff lint
+        run: .venv/bin/ruff check src tests examples benchmarks
+      - name: Ruff format check
+        run: .venv/bin/ruff format --check src tests examples benchmarks
+      - name: Mypy strict
+        run: .venv/bin/mypy src
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      - name: Install dev dependencies
+        run: uv venv --python ${{ matrix.python-version }} && uv pip install -e ".[dev]"
+      - name: Run pytest with coverage
+        run: |
+          .venv/bin/coverage run -m pytest -v
+          .venv/bin/coverage report --fail-under=80
+
+  package-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Verify zero-extra-dependency wheel install
+        run: |
+          uv venv /tmp/iso-venv
+          uv pip install --python /tmp/iso-venv/bin/python dist/*.whl
+          /tmp/iso-venv/bin/python -c "
+          from flask import Flask, jsonify
+          from flask_lens import Lens
+
+          app = Flask(__name__)
+          lens = Lens(app, storage='memory')
+
+          @app.get('/ping')
+          def ping():
+              return jsonify({'ok': True})
+
+          client = app.test_client()
+          assert client.get('/ping').status_code == 200
+          assert client.get('/__lens/').status_code == 200
+          assert client.get('/__lens/api/overview').get_json()['total_requests'] == 1
+          lens.close()
+          "
